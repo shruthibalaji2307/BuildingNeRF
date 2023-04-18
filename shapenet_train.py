@@ -4,9 +4,9 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from datasets.shapenet import build_shapenet
-from models.nerf import build_nerf
-from models.rendering import get_rays_shapenet, sample_points, volume_render
+from datasets.shapenet.shapenet import build_shapenet
+from nerf.nerf_model import build_nerf
+from nerf.rendering import get_rays_shapenet, sample_points, volume_render
 
 
 def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
@@ -22,10 +22,10 @@ def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size
     for step in range(inner_steps):
         indices = torch.randint(num_rays, size=[raybatch_size])
         raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
-        pixelbatch = pixels[indices] 
+        pixelbatch = pixels[indices]
         t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
                                     num_samples, perturb=True)
-        
+
         optim.zero_grad()
         rgbs, sigmas = model(xyz)
         colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
@@ -51,11 +51,11 @@ def train_meta(args, meta_model, meta_optim, data_loader, device):
         inner_loop(inner_model, inner_optim, imgs, poses,
                     hwf, bound, args.num_samples,
                     args.train_batchsize, args.inner_steps)
-        
+
         with torch.no_grad():
             for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
                 meta_param.grad = meta_param - inner_param
-        
+
         meta_optim.step()
 
 
@@ -70,13 +70,13 @@ def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size):
         rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
         t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
                                     num_samples, perturb=False)
-        
+
         synth = []
         num_rays = rays_d.shape[0]
         with torch.no_grad():
             for i in range(0, num_rays, raybatch_size):
                 rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size])
-                color_batch = volume_render(rgbs_batch, sigmas_batch, 
+                color_batch = volume_render(rgbs_batch, sigmas_batch,
                                             t_vals[i:i+raybatch_size],
                                             white_bkgd=True)
                 synth.append(color_batch)
@@ -84,7 +84,7 @@ def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size):
             error = F.mse_loss(img, synth)
             psnr = -10*torch.log10(error)
             view_psnrs.append(psnr)
-    
+
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr
 
@@ -95,7 +95,7 @@ def val_meta(args, model, val_loader, device):
     """
     meta_trained_state = model.state_dict()
     val_model = copy.deepcopy(model)
-    
+
     val_psnrs = []
     for imgs, poses, hwf, bound in val_loader:
         imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
@@ -109,8 +109,8 @@ def val_meta(args, model, val_loader, device):
 
         inner_loop(val_model, val_optim, tto_imgs, tto_poses, hwf,
                     bound, args.num_samples, args.tto_batchsize, args.tto_steps)
-        
-        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, 
+
+        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound,
                                     args.num_samples, args.test_batchsize)
         val_psnrs.append(scene_psnr)
 

@@ -1,294 +1,162 @@
-import os
-import warnings
-
-import hydra
-import numpy as np
+import argparse
+import json
+import copy
 import torch
-import tqdm
-import imageio
-import pytorch3d
-
-from omegaconf import DictConfig
-from PIL import Image
-from pytorch3d.renderer import (
-    PerspectiveCameras,
-    look_at_view_transform
-)
-import matplotlib.pyplot as plt
-
-from nerf.model import volume_dict
-from nerf.sampler import sampler_dict
-from nerf.volume_renderer import renderer_dict
-from nerf.ray_utils import (
-    sample_images_at_xy,
-    get_pixels_from_image,
-    get_random_pixels_from_image,
-    get_rays_from_pixels
-)
-from vis_utils import (
-    dataset_from_config,
-    create_surround_cameras,
-    vis_grid,
-    vis_rays,
-)
-from datasets import (
-    get_nerf_datasets,
-    trivial_collate,
-)
-from nerf.render_functions import (
-    render_points
-)
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from datasets.shapenet.shapenet import build_shapenet
+from nerf.nerf_model import build_nerf
+from nerf.rendering import get_rays_shapenet, sample_points, volume_render
 
 
-class Model(torch.nn.Module):
-    def __init__(
-        self,
-        cfg
-    ):
-        super().__init__()
+def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
+    """
+    train the inner model for a specified number of iterations
+    """
+    pixels = imgs.reshape(-1, 3)
 
-        # Get implicit function from config
-        self.implicit_fn = volume_dict[cfg.implicit_function.type](
-            cfg.implicit_function
-        )
+    rays_o, rays_d = get_rays_shapenet(hwf, poses)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
 
-        # Point sampling (raymarching) scheme
-        self.sampler = sampler_dict[cfg.sampler.type](
-            cfg.sampler
-        )
+    num_rays = rays_d.shape[0]
+    for step in range(inner_steps):
+        indices = torch.randint(num_rays, size=[raybatch_size])
+        raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
+        pixelbatch = pixels[indices]
+        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
+                                    num_samples, perturb=True)
 
-        # Initialize volume renderer
-        self.renderer = renderer_dict[cfg.renderer.type](
-            cfg.renderer
-        )
-
-    def forward(
-        self,
-        ray_bundle
-    ):
-        # Call renderer with
-        #  a) Implicit volume
-        #  b) Sampling routine
-
-        return self.renderer(
-            self.sampler,
-            self.implicit_fn,
-            ray_bundle
-        )
+        optim.zero_grad()
+        rgbs, sigmas = model(xyz)
+        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
+        loss = F.mse_loss(colors, pixelbatch)
+        print("Inner loop step: ", step, " loss: ", loss.item())
+        loss.backward()
+        optim.step()
 
 
+def train_meta(args, meta_model, meta_optim, data_loader, device):
+    """
+    train the meta_model for one epoch using reptile meta learning
+    https://arxiv.org/abs/1803.02999
+    """
+    for imgs, poses, hwf, bound in data_loader:
+        imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
+        imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
 
-def create_model(cfg):
-    # Create model
-    model = Model(cfg)
-    model.cuda(); model.train()
+        meta_optim.zero_grad()
 
-    # Load checkpoints
-    optimizer_state_dict = None
-    start_epoch = 0
+        inner_model = copy.deepcopy(meta_model)
+        inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
 
-    checkpoint_path = os.path.join(
-        hydra.utils.get_original_cwd(),
-        cfg.training.checkpoint_path
-    )
+        inner_loop(inner_model, inner_optim, imgs, poses,
+                    hwf, bound, args.num_samples,
+                    args.train_batchsize, args.inner_steps)
 
-    if len(cfg.training.checkpoint_path) > 0:
-        # Make the root of the experiment directory.
-        checkpoint_dir = os.path.split(checkpoint_path)[0]
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        with torch.no_grad():
+            for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
+                meta_param.grad = meta_param - inner_param
 
-        # Resume training if requested.
-        if cfg.training.resume and os.path.isfile(checkpoint_path):
-            print(f"Resuming from checkpoint {checkpoint_path}.")
-            loaded_data = torch.load(checkpoint_path)
-            model.load_state_dict(loaded_data["model"])
-            start_epoch = loaded_data["epoch"]
-
-            print(f"   => resuming from epoch {start_epoch}.")
-            optimizer_state_dict = loaded_data["optimizer"]
-
-    # Initialize the optimizer.
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.training.lr,
-    )
-
-    # Load the optimizer state dict in case we are resuming.
-    if optimizer_state_dict is not None:
-        optimizer.load_state_dict(optimizer_state_dict)
-        optimizer.last_epoch = start_epoch
-
-    # The learning rate scheduling is implemented with LambdaLR PyTorch scheduler.
-    def lr_lambda(epoch):
-        return cfg.training.lr_scheduler_gamma ** (
-            epoch / cfg.training.lr_scheduler_step_size
-        )
-
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda, last_epoch=start_epoch - 1, verbose=False
-    )
-
-    return model, optimizer, lr_scheduler, start_epoch, checkpoint_path
+        meta_optim.step()
 
 
-def render_images(
-    model,
-    cameras,
-    image_size,
-    save=False,
-    file_prefix=''
-):
-    all_images = []
-    device = list(model.parameters())[0].device
+def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size):
+    """
+    report view-synthesis result on heldout views
+    """
+    ray_origins, ray_directions = get_rays_shapenet(hwf, poses)
 
-    for cam_idx, camera in enumerate(cameras):
-        print(f'Rendering image {cam_idx}')
+    view_psnrs = []
+    for img, rays_o, rays_d in zip(imgs, ray_origins, ray_directions):
+        rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+        t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
+                                    num_samples, perturb=False)
 
-        torch.cuda.empty_cache()
-        camera = camera.to(device)
-        xy_grid = get_pixels_from_image(image_size, camera) # TODO (1.3): implement in ray_utils.py
-        ray_bundle = get_rays_from_pixels(xy_grid, image_size, camera) # TODO (1.3): implement in ray_utils.py
+        synth = []
+        num_rays = rays_d.shape[0]
+        with torch.no_grad():
+            for i in range(0, num_rays, raybatch_size):
+                rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size])
+                color_batch = volume_render(rgbs_batch, sigmas_batch,
+                                            t_vals[i:i+raybatch_size],
+                                            white_bkgd=True)
+                synth.append(color_batch)
+            synth = torch.cat(synth, dim=0).reshape_as(img)
+            error = F.mse_loss(img, synth)
+            psnr = -10*torch.log10(error)
+            view_psnrs.append(psnr)
 
-        # TODO (1.3): Visualize xy grid using vis_grid
-        if cam_idx == 0 and file_prefix == '':
-            grid = vis_grid(xy_grid, image_size)
-            plt.imshow(grid)
-            plt.show()
-
-        # TODO (1.3): Visualize rays using vis_rays
-        if cam_idx == 0 and file_prefix == '':
-            rays = vis_rays(ray_bundle, image_size)
-            plt.imshow(rays)
-            plt.show()
-
-        # TODO (1.4): Implement point sampling along rays in sampler.py
-        ray_bundle = model.sampler(ray_bundle)
-
-        # TODO (1.4): Visualize sample points as point cloud
-        if cam_idx == 0 and file_prefix == '':
-            render_points('images/part_1_4.png', ray_bundle.sample_points.view(-1, 3).unsqueeze(0), image_size, device=device)
-
-        # TODO (1.5): Implement rendering in renderer.py
-        out = model(ray_bundle)
-
-        # Return rendered features (colors)
-        image = np.array(
-            out['feature'].view(
-                image_size[1], image_size[0], 3
-            ).detach().cpu()
-        )
-        all_images.append(image)
-
-        # TODO (1.5): Visualize depth
-        if cam_idx == 2 and file_prefix == '':
-            depth_image = np.array(
-                out['depth'].view(
-                    image_size[1], image_size[0], 1
-                ).detach().cpu()
-            )
-            plt.imshow(depth_image, cmap='summer')
-            plt.show()
-
-        # Save
-        if save:
-            plt.imsave(
-                f'{file_prefix}_{cam_idx}.png',
-                image
-            )
-
-    return all_images
-
-def train_nerf(
-    cfg
-):
-    # Create model
-    model, optimizer, lr_scheduler, start_epoch, checkpoint_path = create_model(cfg)
-
-    # Load the training/validation data.
-    train_dataset, val_dataset, _ = get_nerf_datasets(
-        dataset_name=cfg.data.dataset_name,
-        image_size=[cfg.data.image_size[1], cfg.data.image_size[0]],
-    )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=trivial_collate,
-    )
-
-    # Run the main training loop.
-    for epoch in range(start_epoch, cfg.training.num_epochs):
-        t_range = tqdm.tqdm(enumerate(train_dataloader))
-
-        for iteration, batch in t_range:
-            image, camera, camera_idx = batch[0].values()
-            image = image.cuda().unsqueeze(0)
-            camera = camera.cuda()
-
-            # Sample rays
-            xy_grid = get_random_pixels_from_image(
-                cfg.training.batch_size, cfg.data.image_size, camera
-            )
-            ray_bundle = get_rays_from_pixels(
-                xy_grid, cfg.data.image_size, camera
-            )
-            rgb_gt = sample_images_at_xy(image, xy_grid)
-
-            # Run model forward
-            out = model(ray_bundle)
-
-            # TODO (3.1): Calculate loss
-            loss = torch.nn.functional.mse_loss(rgb_gt, out['feature'])
-
-            # Take the training step.
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            t_range.set_description(f'Epoch: {epoch:04d}, Loss: {loss:.06f}')
-            t_range.refresh()
-
-        # Adjust the learning rate.
-        lr_scheduler.step()
-
-        # Checkpoint.
-        if (
-            epoch % cfg.training.checkpoint_interval == 0
-            and len(cfg.training.checkpoint_path) > 0
-            and epoch > 0
-        ):
-            print(f"Storing checkpoint {checkpoint_path}.")
-
-            data_to_store = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-            }
-
-            torch.save(data_to_store, checkpoint_path)
-
-        # Render
-        if (
-            epoch % cfg.training.render_interval == 0
-            and epoch > 0
-        ):
-            with torch.no_grad():
-                test_images = render_images(
-                    model, create_surround_cameras(4.0, n_poses=20, up=(0.0, 0.0, 1.0), focal_length=2.0),
-                    cfg.data.image_size, file_prefix='nerf'
-                )
-                imageio.mimsave('images/part_3.gif', [np.uint8(im * 255) for im in test_images])
+    scene_psnr = torch.stack(view_psnrs).mean()
+    return scene_psnr
 
 
-@hydra.main(config_path='./configs', config_name='nerf_lego')
-def main(cfg: DictConfig):
-    os.chdir(hydra.utils.get_original_cwd())
+def val_meta(args, model, val_loader, device):
+    """
+    validate the meta trained model for few-shot view synthesis
+    """
+    meta_trained_state = model.state_dict()
+    val_model = copy.deepcopy(model)
 
-    if cfg.type == 'train_nerf':
-        train_nerf(cfg)
+    val_psnrs = []
+    for imgs, poses, hwf, bound in val_loader:
+        imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
+        imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
+
+        tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)
+        tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
+
+        val_model.load_state_dict(meta_trained_state)
+        val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
+
+        inner_loop(val_model, val_optim, tto_imgs, tto_poses, hwf,
+                    bound, args.num_samples, args.tto_batchsize, args.tto_steps)
+
+        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound,
+                                    args.num_samples, args.test_batchsize)
+        val_psnrs.append(scene_psnr)
+
+    val_psnr = torch.stack(val_psnrs).mean()
+    return val_psnr
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
+    parser.add_argument('--config', type=str, required=True,
+                        help='config file for the shape class (cars, chairs or lamps)')
+    args = parser.parse_args()
+
+    with open(args.config) as config:
+        info = json.load(config)
+        for key, value in info.items():
+            args.__dict__[key] = value
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_set = build_shapenet(image_set="train", dataset_root=args.dataset_root,
+                                splits_path=args.splits_path, num_views=args.train_views)
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
+
+    val_set = build_shapenet(image_set="val", dataset_root=args.dataset_root,
+                            splits_path=args.splits_path,
+                            num_views=args.tto_views+args.test_views)
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
+
+    meta_model = build_nerf(args)
+    meta_model.to(device)
+
+    meta_optim = torch.optim.Adam(meta_model.parameters(), lr=args.meta_lr)
+
+    for epoch in range(1, args.meta_epochs+1):
+        train_meta(args, meta_model, meta_optim, train_loader, device)
+        val_psnr = val_meta(args, meta_model, val_loader, device)
+        print(f"Epoch: {epoch}, val psnr: {val_psnr:0.3f}")
+
+        torch.save({
+            'epoch': epoch,
+            'meta_model_state_dict': meta_model.state_dict(),
+            'meta_optim_state_dict': meta_optim.state_dict(),
+            }, f'meta_epoch{epoch}.pth')
+
+
+if __name__ == '__main__':
     main()

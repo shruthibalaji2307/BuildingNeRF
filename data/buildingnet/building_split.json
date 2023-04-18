@@ -1,0 +1,5 @@
+{
+    "train": ["castle_0"],
+    "val": ["castle_1"],
+    "test": ["castle_1"]
+}
