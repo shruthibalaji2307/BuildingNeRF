@@ -1,7 +1,7 @@
 import math
 import imageio
 import torch
-from models.rendering import get_rays_shapenet, sample_points, volume_render
+from nerf.rendering import get_rays_shapenet, sample_points, volume_render
 
 
 def create_posemat(radius, theta, phi):
@@ -28,14 +28,14 @@ def create_posemat(radius, theta, phi):
                                 [0, torch.sin(phi), torch.cos(phi), 0],
                                 [0, 0, 0, 1],
                                 ], dtype=torch.float)
-        
+
     pose = rot_theta(theta) @ rot_phi(phi) @ trans_t(radius)
     pose = torch.as_tensor([[-1, 0, 0, 0],
                             [0, 0, 1, 0],
                             [0, 1, 0, 0],
                             [0, 0, 0, 1]
                             ], dtype=torch.float) @ pose
-    
+
     return pose
 
 
@@ -50,7 +50,7 @@ def get_360_poses(radius=4, phi=math.pi/5, num_poses=120):
     for theta in torch.linspace(0, 2*math.pi, num_poses+1)[:-1]:
         all_poses.append(create_posemat(radius, theta, phi))
     all_poses = torch.stack(all_poses, dim=0)
-    
+
     return all_poses
 
 
@@ -66,7 +66,7 @@ def create_360_video(args, model, hwf, bound, device, scene_id, savedir):
         rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
         t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
                                     args.num_samples, perturb=False)
-        
+
         synth = []
         num_rays = rays_d.shape[0]
         with torch.no_grad():

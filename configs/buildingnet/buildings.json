@@ -8,7 +8,7 @@
     "hidden_features": 256,
 
     "train_views": 100,
-    "meta_epochs": 30,
+    "meta_epochs": 20,
     "meta_lr": 5e-5,
     "train_batchsize": 128,
     "num_samples": 128,

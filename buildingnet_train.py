@@ -4,7 +4,7 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from datasets.shapenet.shapenet import build_shapenet
+from datasets.shapenet import build_shapenet
 from nerf.nerf_model import build_nerf
 from nerf.rendering import get_rays_shapenet, sample_points, volume_render
 
@@ -84,6 +84,7 @@ def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size):
             synth = torch.cat(synth, dim=0).reshape_as(img)
             error = F.mse_loss(img, synth)
             psnr = -10*torch.log10(error)
+            print("Report result error: ", error.item(), " psnr: ", psnr)
             view_psnrs.append(psnr)
 
     scene_psnr = torch.stack(view_psnrs).mean()
@@ -123,6 +124,8 @@ def main():
     parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
     parser.add_argument('--config', type=str, required=True,
                         help='config file for the shape class (cars, chairs or lamps)')
+    parser.add_argument('--load_checkpoint', type=bool, help='load checkpoint - True or False')
+    parser.add_argument('--checkpoint_path', type=str, help='checkpoint path')
     args = parser.parse_args()
 
     with open(args.config) as config:
@@ -146,16 +149,24 @@ def main():
 
     meta_optim = torch.optim.Adam(meta_model.parameters(), lr=args.meta_lr)
 
-    for epoch in range(1, args.meta_epochs+1):
+    epoch=1
+    if args.load_checkpoint:
+        checkpoint = torch.load(args.checkpoint_path)
+        meta_model.load_state_dict(checkpoint['meta_model_state_dict'])
+        meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
+        epoch = checkpoint['epoch']
+
+    for epoch in range(epoch, args.meta_epochs+1):
         train_meta(args, meta_model, meta_optim, train_loader, device)
         val_psnr = val_meta(args, meta_model, val_loader, device)
         print(f"Epoch: {epoch}, val psnr: {val_psnr:0.3f}")
 
-        torch.save({
-            'epoch': epoch,
-            'meta_model_state_dict': meta_model.state_dict(),
-            'meta_optim_state_dict': meta_optim.state_dict(),
-            }, f'meta_epoch{epoch}.pth')
+        if epoch % 5 == 0:
+            torch.save({
+                'epoch': epoch,
+                'meta_model_state_dict': meta_model.state_dict(),
+                'meta_optim_state_dict': meta_optim.state_dict(),
+                }, f'meta_epoch{epoch}.pth')
 
 
 if __name__ == '__main__':
